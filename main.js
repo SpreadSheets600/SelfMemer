@@ -45,6 +45,7 @@ const _cfg = {
     pm_cooldown:       config.pm_cooldown       ?? 20,
     adv_cooldown:      config.adv_cooldown      ?? 1800,
     wait_for_response: config.wait_for_response ?? 10,
+    hl_wait_for:       config.hl_wait_for       ?? 5,
     search_risk:           config.search_risk           ?? 'medium',
     crime_risk:            config.crime_risk            ?? 'medium',
     search_custom_ranking: Array.isArray(config.search_custom_ranking) ? config.search_custom_ranking : [],
@@ -88,10 +89,10 @@ async function configReloadLoop() {
             const fresh = loadAccountConfig();
             for (const key of [
                 'cooldown', 'search_cooldown', 'beg_cooldown', 'crime_cooldown',
-                'hl_cooldown', 'pm_cooldown', 'wait_for_response',
+                'hl_cooldown', 'hl_wait_for', 'pm_cooldown', 'wait_for_response',
                 'search_risk', 'crime_risk', 'adv_cooldown', 'adv_type', 'fish_sell_currency', 'disable_interaction_lock',
                 'limit_flags', 'stealth_mode', 'cycle_uptime_mins', 'cycle_downtime_mins',
-                'market_sniper_enabled', 'market_sniper_cooldown',
+                'market_sniper_enabled', 'market_sniper_cooldown', 'market_study_item',
                 'daily_cooldown', 'work_cooldown', 'deposit_cooldown',
                 'trivia_cooldown', 'stream_cooldown', 'pet_cooldown',
             ]) {
@@ -369,13 +370,24 @@ const STEALTH_MODES = {
 // ── Limit Flags helpers ─────────────────────────────────────
 let _botPaused = false;  // set by cycleLoop when in downtime
 const PAUSED_FLAG = path.join(__dirname, `paused_${ACCOUNT_ID}.flag`);
+const CAPTCHA_FLAG = path.join(__dirname, `captcha_${ACCOUNT_ID}.flag`);
+const RESUME_FLAG  = path.join(__dirname, `resume_${ACCOUNT_ID}.flag`);
+let _captchaPaused = false; // set until user clears via /api/.../resume
 
-function setPaused(paused) {
+function setPaused(paused, fromCaptcha = false) {
     _botPaused = paused;
+    if (fromCaptcha) _captchaPaused = true;
     try {
         if (paused) fs.writeFileSync(PAUSED_FLAG, '1');
         else        fs.unlinkSync(PAUSED_FLAG);
+        if (fromCaptcha) try { fs.writeFileSync(CAPTCHA_FLAG, '1'); } catch {}
     } catch {}
+}
+
+function clearCaptchaPause() {
+    _captchaPaused = false;
+    try { fs.unlinkSync(CAPTCHA_FLAG); } catch {}
+    try { fs.unlinkSync(RESUME_FLAG);  } catch {}
 }
 
 function _stealthMode() {
@@ -742,7 +754,12 @@ function pickAdventureChoice(advType, embedDescription, buttons) {
         let best = rule.best;
         if (_cfg.adv_response_mode === 'custom') {
             const customForAdv = (_cfg.adv_custom_responses || {})[advType] || {};
-            const customChoice = customForAdv[rule.keywords[0]];
+            const customChoice = customForAdv[rule.keywords[0]]
+                ?? Object.entries(customForAdv).find(([k]) =>
+                    rule.keywords.some(kw =>
+                        kw.toLowerCase().includes(k.toLowerCase()) ||
+                        k.toLowerCase().includes(kw.toLowerCase()))
+                   )?.[1];
             if (customChoice) best = customChoice;
         }
 
@@ -801,7 +818,10 @@ async function resolveChannel(client, channelId) {
 }
 
 // Clear any stale paused flag from a previous crashed session
-try { fs.unlinkSync(PAUSED_FLAG); } catch {}
+for (const p of [PAUSED_FLAG, CAPTCHA_FLAG, RESUME_FLAG,
+                 path.join(__dirname, `interaction_lock_${ACCOUNT_ID}.lock`)]) {
+    try { fs.unlinkSync(p); } catch {}
+}
 
 // ── Command loops ──────────────────────────────────────────
 client.on('ready', async () => {
@@ -819,6 +839,7 @@ client.on('ready', async () => {
     const guildId = channel.guildId ?? channel.guild?.id ?? '@me';
     const exactReferer = `https://discord.com/channels/${guildId}/${CHANNEL_ID}`;
     client.options.http.headers['Referer'] = exactReferer;
+    try { if (client.rest?.options?.headers) client.rest.options.headers['Referer'] = exactReferer; } catch {}
     log('info', `[HEADERS] Referer updated → ${exactReferer}`);
 
     // ── Save own Discord UID for mothership system ──────────
@@ -1036,9 +1057,12 @@ client.on('ready', async () => {
             for (const m of matches) {
                 const raw     = m[1].trim();
                 const noEmoji = raw.replace(/<a?:\w+:\d+>\s*/g, '').trim();
-                const name    = noEmoji.replace(/\s+/g, '');
+                // Keep spaces — Dank Memer item names are multi-word. The
+                // IGNORED_ITEMS set stores the stripped form for easy matching.
+                const name    = noEmoji.replace(/\s+/g, ' ').trim();
                 const qty     = parseInt(m[2].replace(/,/g, ''), 10);
-                if (name && qty > 0 && !IGNORED_ITEMS.has(name.toLowerCase())) items.push({ name, qty });
+                const ignored = IGNORED_ITEMS.has(name.toLowerCase().replace(/\s+/g, ''));
+                if (name && qty > 0 && !ignored) items.push({ name, qty });
             }
         }
         return items;
@@ -1339,6 +1363,7 @@ client.on('ready', async () => {
         await sleep(8000);
         while (true) {
             await sleep(2000);
+            if (_botPaused) continue;
 
             // Only the mothership account runs this
             let rawCfg;
@@ -1413,45 +1438,81 @@ client.on('ready', async () => {
     // ── Uptime / Downtime cycle ──────────────────────────────
     // Polls every 5 s so config changes (disable, duration edits) take effect
     // within one polling tick instead of waiting for a full sleep to expire.
+    const CYCLE_STATE = path.join(__dirname, `cycle_${ACCOUNT_ID}.json`);
+    function readCycleState() {
+        try { return JSON.parse(fs.readFileSync(CYCLE_STATE, 'utf8')); } catch { return null; }
+    }
+    function writeCycleState(mode, until) {
+        try { fs.writeFileSync(CYCLE_STATE, JSON.stringify({ mode, until })); } catch {}
+    }
+
     async function cycleLoop() {
+        // Restore a downtime interrupted by a process restart: honour the rest
+        // of the pause before returning to normal operation.
+        try {
+            const saved = readCycleState();
+            if (saved?.mode === 'downtime' && saved.until > Date.now() &&
+                _cfg.limit_flags && _cfg.cycle_uptime_mins && _cfg.cycle_downtime_mins) {
+                setPaused(true);
+                log('info', `[CYCLE] Resuming downtime — ~${Math.round((saved.until - Date.now()) / 60000)}min remaining`);
+                while (Date.now() < saved.until) {
+                    await sleep(5000);
+                    if (!_cfg.limit_flags || !_cfg.cycle_uptime_mins || !_cfg.cycle_downtime_mins) {
+                        if (!_captchaPaused) setPaused(false);
+                        writeCycleState('off', 0);
+                        break;
+                    }
+                }
+            }
+        } catch {}
+
         while (true) {
+            // Manual resume clears a CAPTCHA-forced pause
+            if (_captchaPaused && fs.existsSync(RESUME_FLAG)) {
+                clearCaptchaPause();
+                setPaused(false);
+                log('info', '[CAPTCHA] Resume requested — bot unpaused');
+            }
+
             const up   = _cfg.cycle_uptime_mins;
             const down = _cfg.cycle_downtime_mins;
 
-            // Cycle disabled — keep bot unpaused and re-check shortly
+            // Cycle disabled — keep bot unpaused (unless CAPTCHA-paused) and re-check
             if (!_cfg.limit_flags || !up || !down) {
-                if (_botPaused) setPaused(false);
+                if (_botPaused && !_captchaPaused) setPaused(false);
+                writeCycleState('off', 0);
                 await sleep(5000);
                 continue;
             }
 
             // === UPTIME ===
-            // Unpause immediately — no 5 s gap at the top of the loop
-            setPaused(false);
+            if (!_captchaPaused) setPaused(false);
             log('info', `[CYCLE] Uptime started — active for ${up}min`);
             const uptimeEnd = Date.now() + up * 60000;
+            writeCycleState('uptime', uptimeEnd);
             while (Date.now() < uptimeEnd) {
                 await sleep(5000);
-                // Cycle disabled mid-uptime — exit early, skip downtime
                 if (!_cfg.limit_flags || !_cfg.cycle_uptime_mins || !_cfg.cycle_downtime_mins) break;
             }
 
             // Re-check: if cycle was turned off during uptime, stay unpaused
             if (!_cfg.limit_flags || !_cfg.cycle_uptime_mins || !_cfg.cycle_downtime_mins) {
-                if (_botPaused) setPaused(false);
+                if (_botPaused && !_captchaPaused) setPaused(false);
+                writeCycleState('off', 0);
                 continue;
             }
 
             // === DOWNTIME ===
-            setPaused(true);
+            if (!_captchaPaused) setPaused(true);
             const downMins = _cfg.cycle_downtime_mins;
             log('info', `[CYCLE] Downtime started — resting for ${downMins}min`);
             const downtimeEnd = Date.now() + downMins * 60000;
+            writeCycleState('downtime', downtimeEnd);
             while (Date.now() < downtimeEnd) {
                 await sleep(5000);
-                // Cycle disabled mid-downtime — unpause immediately
                 if (!_cfg.limit_flags || !_cfg.cycle_uptime_mins || !_cfg.cycle_downtime_mins) {
-                    setPaused(false);
+                    if (!_captchaPaused) setPaused(false);
+                    writeCycleState('off', 0);
                     break;
                 }
             }
@@ -1560,7 +1621,7 @@ client.on('ready', async () => {
             if (_botPaused) { await sleep(5000); continue; }
             if (_cfg.commands_enabled.hl) {
                 await runWithLock(async () => {
-                    const res = await sendAndWait(channel, 'pls hl', _cfg.wait_for_response);
+                    const res = await sendAndWait(channel, 'pls hl', _cfg.hl_wait_for ?? _cfg.wait_for_response);
                     if (res) {
                         if (isPremiumCooldown(res)) { log('warn', '[HL] Premium cooldown — skipping'); return; }
                         const desc  = res.embeds[0]?.description || '';
@@ -1847,13 +1908,23 @@ client.on('ready', async () => {
     }
 
     // ── Fishing loop ─────────────────────────────────────────
+    let _fishSessionActive = false;
+    let _sniperSessionActive = false;
     async function fishLoop() {
         await sleep(7000);
         while (true) {
             if (_botPaused) { await sleep(5000); continue; }
-            if (!_cfg.commands_enabled?.fish) { await sleep(5000); continue; }
 
-            await _interactionLock.runExclusive(async () => {
+            const fishOn = !!_cfg.commands_enabled?.fish;
+            if (fishOn && !_fishSessionActive) {
+                _fishSessionActive = true;
+                log('info', '[FISH:SESSION_START]');
+            } else if (!fishOn && _fishSessionActive) {
+                _fishSessionActive = false;
+            }
+            if (!fishOn) { await sleep(5000); continue; }
+
+            await runWithLock(async () => {
                 log('info', '[FISH] Fishing started');
 
                 // Step 1: send pls fish catch
@@ -2156,7 +2227,15 @@ client.on('ready', async () => {
     async function marketSniperLoop() {
         await sleep(35000); // stagger after other loops
         while (true) {
-            if (!_cfg.market_sniper_enabled || !Array.isArray(_cfg.market_sniper_items) || !_cfg.market_sniper_items.length) {
+            if (_botPaused) { await sleep(5000); continue; }
+            const sniperOn = !!_cfg.market_sniper_enabled && Array.isArray(_cfg.market_sniper_items) && _cfg.market_sniper_items.length > 0;
+            if (sniperOn && !_sniperSessionActive) {
+                _sniperSessionActive = true;
+                log('info', '[SNIPER:SESSION_START]');
+            } else if (!sniperOn && _sniperSessionActive) {
+                _sniperSessionActive = false;
+            }
+            if (!sniperOn) {
                 await sleep(5000);
                 continue;
             }
@@ -2283,7 +2362,8 @@ client.on('ready', async () => {
     // Sends `pls market view <item>` once, dumps the FULL raw component
     // tree and all interactive elements so we can study the structure.
     async function studyMarketView() {
-        const item = _cfg.market_study_item;
+        const envItem = process.env.SELFMEMER_MARKET_STUDY;
+        const item = (envItem && envItem !== '1') ? envItem : _cfg.market_study_item;
         if (!item) return;
 
         log('info', `[STUDY] === Starting market view study for: "${item}" ===`);
@@ -2765,8 +2845,8 @@ client.on('ready', async () => {
         // ── 1. CAPTCHA — pause bot immediately ───────────────────────────
         for (const embed of (msg.embeds || [])) {
             if ((embed.title || '').toUpperCase().includes('CAPTCHA')) {
-                log('warn', '[CAPTCHA] CAPTCHA detected — pausing bot! Solve it manually.');
-                setPaused(true);
+                log('warn', '[CAPTCHA] CAPTCHA detected — bot paused. Solve it, then click "Resume bot" in the dashboard.');
+                setPaused(true, true);
                 return;
             }
         }
@@ -2928,17 +3008,55 @@ client.on('ready', async () => {
         }
     });
 
-    Promise.all([
-        configReloadLoop(), heartbeatLoop(),
-        cycleLoop(),
-        begLoop(), searchLoop(), digLoop(), huntLoop(), crimeLoop(), hlLoop(), pmLoop(),
-        advLoop(),
-        fishLoop(), transferLoop(),
-        dailyLoop(), workLoop(), depositLoop(),
-        triviaLoop(), streamLoop(), petLoop(),
-        marketSniperLoop(), mothershipMarketLoop(),
-        studyMarketView(),
-    ]).catch(e => log('error', `Fatal: ${e.message}`));
+    // ── Loop supervisor ──────────────────────────────────────
+    // A loop that throws (e.g. one transient Discord API error) must not die
+    // silently while the process keeps looking alive. Restart it instead.
+    async function supervise(name, fn) {
+        while (true) {
+            try {
+                await fn();
+                log('error', `[SUPERVISOR] ${name} returned unexpectedly — restarting loop`);
+            } catch (e) {
+                log('error', `[SUPERVISOR] ${name} crashed: ${e.message} — restarting loop in 5s`);
+            }
+            await sleep(5000);
+        }
+    }
+
+    const loopFns = [
+        configReloadLoop, heartbeatLoop, cycleLoop,
+        begLoop, searchLoop, digLoop, huntLoop, crimeLoop, hlLoop, pmLoop,
+        advLoop, fishLoop, transferLoop,
+        dailyLoop, workLoop, depositLoop,
+        triviaLoop, streamLoop, petLoop,
+        marketSniperLoop, mothershipMarketLoop,
+    ];
+
+    const loops = loopFns.map(fn => supervise(fn.name, fn));
+
+    // Market study probe is opt-in via env var; never auto-clicks in normal operation
+    if (process.env.SELFMEMER_MARKET_STUDY) {
+        log('info', '[STUDY] SELFMEMER_MARKET_STUDY set — running market study probe');
+        loops.push(supervise('studyMarketView', studyMarketView));
+    }
+
+    Promise.all(loops).catch(e => log('error', `Fatal: ${e.message}`));
 });
 
-client.login(TOKEN);
+process.on('SIGTERM', () => shutdownMain('SIGTERM'));
+process.on('SIGINT',  () => shutdownMain('SIGINT'));
+let _shuttingDown = false;
+function shutdownMain() {
+    if (_shuttingDown) return;
+    _shuttingDown = true;
+    try { fs.unlinkSync(PAUSED_FLAG); } catch {}
+    try { fs.unlinkSync(CAPTCHA_FLAG); } catch {}
+    try { fs.unlinkSync(_interactionLock.lockFilePath); } catch {}
+    try { client.destroy(); } catch {}
+    process.exit(0);
+}
+
+client.login(TOKEN).catch(err => {
+    log('error', `Login failed for account ${ACCOUNT_ID}: ${err.message} — check token/channel config`);
+    process.exit(1);
+});
