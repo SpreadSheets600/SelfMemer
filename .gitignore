@@ -1,0 +1,25 @@
+# SelfMemer local state & secrets ── keep out of version control
+config.json
+
+# Balance history per account
+balance_*.json
+fish_stats.json
+sniper_stats.json
+
+# Runtime artefacts (locks, flags, transfer triggers, cycle state)
+*.lock
+*.flag
+transfer_trigger_*.json
+transfer_status_*.json
+market_pending_*.json
+cycle_*.json
+*.tmp
+
+# Dependencies
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
