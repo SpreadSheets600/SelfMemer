@@ -15,6 +15,8 @@ NUMERIC_FIELDS = [
     "cooldown", "search_cooldown", "beg_cooldown", "crime_cooldown",
     "hl_cooldown", "hl_wait_for", "pm_cooldown", "wait_for_response",
     "adv_cooldown",
+    "daily_cooldown", "work_cooldown", "deposit_cooldown",
+    "trivia_cooldown", "stream_cooldown", "pet_cooldown",
 ]
 RISK_FIELDS  = ["search_risk", "crime_risk"]
 VALID_RISK   = {"low", "medium", "high", "custom"}
@@ -35,7 +37,11 @@ DEFAULT_ACCOUNT = {
     "crime_cooldown": 40, "hl_cooldown": 10, "hl_wait_for": 5,
     "pm_cooldown": 20, "wait_for_response": 10,
     "adv_cooldown": 1800,
+    "daily_cooldown": 86400, "work_cooldown": 3600, "deposit_cooldown": 60,
+    "trivia_cooldown": 10, "stream_cooldown": 660, "pet_cooldown": 1800,
     "adv_type": "Pepe Goes to Space",
+    "adv_response_mode": "recommended",
+    "adv_custom_responses": {},
     "search_risk": "medium", "crime_risk": "medium",
     "commands_enabled": {
         "hunt": True, "dig": True, "search": True,
@@ -55,6 +61,13 @@ DEFAULT_ACCOUNT = {
 # ── Config helpers ─────────────────────────────────────────
 _config_lock = threading.Lock()
 
+def _write_json_atomic(path, data):
+    """Write JSON via a temp file + rename so readers never see a torn document."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=4)
+    os.replace(tmp, path)
+
 def load_config():
     with _config_lock:
         with open(CONFIG_PATH) as f:
@@ -62,8 +75,16 @@ def load_config():
 
 def save_config(cfg):
     with _config_lock:
-        with open(CONFIG_PATH, "w") as f:
-            json.dump(cfg, f, indent=4)
+        _write_json_atomic(CONFIG_PATH, cfg)
+
+def modify_config(fn):
+    """Atomically read → mutate → write config.json under a single lock."""
+    with _config_lock:
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+        fn(cfg)
+        _write_json_atomic(CONFIG_PATH, cfg)
+    return cfg
 
 def get_accounts():
     return load_config().get("accounts", [])
@@ -87,35 +108,28 @@ _fish_lock  = threading.Lock()
 _sniper_stats = {}  # account_id -> {session_start, buys: [{item, price, qty, ts}]}
 _sniper_lock  = threading.Lock()
 
+SNIPER_STATS_PATH = os.path.join(BASE_DIR, "sniper_stats.json")
+FISH_STATS_PATH   = os.path.join(BASE_DIR, "fish_stats.json")
+
+def _persist_stats():
+    try: _write_json_atomic(SNIPER_STATS_PATH, _sniper_stats)
+    except Exception: pass
+    try: _write_json_atomic(FISH_STATS_PATH, _fish_stats)
+    except Exception: pass
+
+try:
+    with open(FISH_STATS_PATH) as _f:
+        _fish_stats = json.load(_f)
+except Exception:
+    _fish_stats = {}
+try:
+    with open(SNIPER_STATS_PATH) as _f:
+        _sniper_stats = json.load(_f)
+except Exception:
+    _sniper_stats = {}
+
 def _make_sniper_state():
     return {"session_start": time.time(), "buys": []}
-
-def _update_sniper_from_log(source, msg):
-    parts = source.split(":")
-    account_id = parts[-1] if len(parts) >= 2 else None
-    if not account_id:
-        return
-    if not msg.startswith("[SNIPER:BUY] "):
-        return
-    rest   = msg[len("[SNIPER:BUY] "):]
-    tokens = rest.rsplit(None, 2)
-    if len(tokens) < 3:
-        return
-    item = tokens[0]
-    try:
-        price = int(tokens[1])
-        qty   = int(tokens[2])
-    except Exception:
-        return
-    with _sniper_lock:
-        if account_id not in _sniper_stats:
-            _sniper_stats[account_id] = _make_sniper_state()
-        _sniper_stats[account_id]["buys"].append({
-            "item": item, "price": price, "qty": qty,
-            "ts": int(time.time() * 1000),
-        })
-        if len(_sniper_stats[account_id]["buys"]) > 200:
-            _sniper_stats[account_id]["buys"] = _sniper_stats[account_id]["buys"][-200:]
 
 def _make_fish_state():
     return {"session_start": time.time(), "catches": {}, "sells": 0, "timeline": []}
@@ -150,14 +164,31 @@ def _update_fish_from_log(source, msg):
             s["timeline"].append({"ts": ts, "fish": dict(s["catches"]), "sells": s["sells"]})
             if len(s["timeline"]) > 300:
                 s["timeline"] = s["timeline"][-300:]
+            _persist_stats()
 
 def _add_log(level, source, msg):
     entry = {"ts": int(time.time() * 1000), "level": level, "source": source, "msg": msg}
     with _log_lock:
         _log_buffer.append(entry)
         _heartbeat[source] = time.time()
+
+    # Session markers keep the dashboard timers honest across enable/disable
+    parts = source.split(":")
+    account_id = parts[-1] if len(parts) >= 2 else None
+    if account_id and msg.startswith("[FISH:SESSION_START]"):
+        with _fish_lock:
+            if account_id not in _fish_stats:
+                _fish_stats[account_id] = _make_fish_state()
+            _fish_stats[account_id]["session_start"] = time.time()
+        _persist_stats()
+    if account_id and msg.startswith("[SNIPER:SESSION_START]"):
+        with _sniper_lock:
+            if account_id not in _sniper_stats:
+                _sniper_stats[account_id] = _make_sniper_state()
+            _sniper_stats[account_id]["session_start"] = time.time()
+        _persist_stats()
+
     _update_fish_from_log(source, msg)
-    _update_sniper_from_log(source, msg)
 
 # ── Routes ─────────────────────────────────────────────────
 
@@ -187,72 +218,110 @@ def create_account():
         "id": account_id, "name": name,
         "token": token, "channel_id": channel_id, "bot_id": bot_id,
         "commands_enabled": dict(DEFAULT_ACCOUNT["commands_enabled"]),
+        "search_custom_ranking": [],
+        "crime_custom_ranking":  [],
     }
 
-    cfg = load_config()
-    cfg.setdefault("accounts", []).append(account)
-    save_config(cfg)
+    def _add(cfg):
+        cfg.setdefault("accounts", []).append(account)
+    modify_config(_add)
     return jsonify({"ok": True, "account": account})
 
 @app.route("/api/accounts/<account_id>", methods=["DELETE"])
 def delete_account(account_id):
-    cfg = load_config()
-    cfg["accounts"] = [a for a in cfg.get("accounts", []) if a["id"] != account_id]
-    save_config(cfg)
-    bal_path = os.path.join(BASE_DIR, f"balance_{account_id}.json")
-    try: os.remove(bal_path)
-    except: pass
+    def _del(cfg):
+        cfg["accounts"] = [a for a in cfg.get("accounts", []) if a["id"] != account_id]
+        if cfg.get("mothership_id") == account_id:
+            cfg["mothership_id"] = None
+    modify_config(_del)
+
+    # Remove all per-account runtime artefacts, not just the balance history
+    for f in (
+        f"balance_{account_id}.json",
+        f"paused_{account_id}.flag",
+        f"interaction_lock_{account_id}.lock",
+        f"captcha_{account_id}.flag",
+        f"resume_{account_id}.flag",
+        f"transfer_trigger_{account_id}.json",
+        f"transfer_status_{account_id}.json",
+        f"market_pending_{account_id}.json",
+        f"market_pending_coins_{account_id}.json",
+        f"cycle_{account_id}.json",
+    ):
+        try: os.remove(os.path.join(BASE_DIR, f))
+        except OSError: pass
     return jsonify({"ok": True})
 
 @app.route("/api/accounts/<account_id>", methods=["PUT"])
 def update_account(account_id):
     data = request.get_json(silent=True) or {}
-    cfg  = load_config()
-    for i, account in enumerate(cfg.get("accounts", [])):
-        if account["id"] != account_id:
-            continue
-        if "name"  in data: account["name"]  = str(data["name"])[:50]
-        if "token" in data: account["token"] = str(data["token"])
-        if "channel_id" in data:
-            v = str(data["channel_id"]).strip()
-            if v: account["channel_id"] = v
-        if "bot_id" in data:
-            v = str(data["bot_id"]).strip()
-            if v: account["bot_id"] = v
-        for key in NUMERIC_FIELDS:
-            if key in data and isinstance(data[key], (int, float)) and data[key] > 0:
-                account[key] = data[key]
-        for key in RISK_FIELDS:
-            if key in data and data[key] in VALID_RISK:
-                account[key] = data[key]
-        if "adv_type" in data and data["adv_type"] in VALID_ADV_TYPES:
-            account["adv_type"] = data["adv_type"]
-        if "commands_enabled" in data and isinstance(data["commands_enabled"], dict):
-            account.setdefault("commands_enabled", {})
-            for cmd in COMMAND_KEYS:
-                if cmd in data["commands_enabled"]:
-                    account["commands_enabled"][cmd] = bool(data["commands_enabled"][cmd])
-        if "bal_tracker_enabled" in data:
-            account["bal_tracker_enabled"] = bool(data["bal_tracker_enabled"])
-        if "fish_sell_currency" in data and data["fish_sell_currency"] in ("coins", "tokens"):
-            account["fish_sell_currency"] = data["fish_sell_currency"]
-        if "disable_interaction_lock" in data:
-            account["disable_interaction_lock"] = bool(data["disable_interaction_lock"])
-        if "limit_flags" in data:
-            account["limit_flags"] = bool(data["limit_flags"])
-        if "stealth_mode" in data and data["stealth_mode"] in ("strict", "moderate", "casual", "fast"):
-            account["stealth_mode"] = data["stealth_mode"]
-        if "cycle_uptime_mins" in data and isinstance(data["cycle_uptime_mins"], (int, float)):
-            account["cycle_uptime_mins"] = max(0, int(data["cycle_uptime_mins"]))
-        if "cycle_downtime_mins" in data and isinstance(data["cycle_downtime_mins"], (int, float)):
-            account["cycle_downtime_mins"] = max(0, int(data["cycle_downtime_mins"]))
-        if "search_custom_ranking" in data and isinstance(data["search_custom_ranking"], list):
-            account["search_custom_ranking"] = [str(x)[:120] for x in data["search_custom_ranking"][:300] if isinstance(x, str)]
-        if "crime_custom_ranking" in data and isinstance(data["crime_custom_ranking"], list):
-            account["crime_custom_ranking"] = [str(x)[:120] for x in data["crime_custom_ranking"][:100] if isinstance(x, str)]
-        cfg["accounts"][i] = account
-        break
-    save_config(cfg)
+    found = False
+
+    def _update(cfg):
+        nonlocal found
+        for i, account in enumerate(cfg.get("accounts", [])):
+            if account["id"] != account_id:
+                continue
+            found = True
+            if "name"  in data: account["name"]  = str(data["name"])[:50]
+            if "token" in data: account["token"] = str(data["token"])
+            if "channel_id" in data:
+                v = str(data["channel_id"]).strip()
+                if v: account["channel_id"] = v
+            if "bot_id" in data:
+                v = str(data["bot_id"]).strip()
+                if v: account["bot_id"] = v
+            for key in NUMERIC_FIELDS:
+                v = data.get(key)
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+                    account[key] = v
+            for key in RISK_FIELDS:
+                if key in data and data[key] in VALID_RISK:
+                    account[key] = data[key]
+            if "adv_type" in data and data["adv_type"] in VALID_ADV_TYPES:
+                account["adv_type"] = data["adv_type"]
+            if "adv_response_mode" in data and data["adv_response_mode"] in ("recommended", "custom"):
+                account["adv_response_mode"] = data["adv_response_mode"]
+            if "adv_custom_responses" in data and isinstance(data["adv_custom_responses"], dict):
+                clean = {}
+                for adv, answers in data["adv_custom_responses"].items():
+                    if not isinstance(answers, dict):
+                        continue
+                    clean[str(adv)[:80]] = {
+                        str(q)[:160]: str(a)[:200]
+                        for q, a in list(answers.items())[:60]
+                        if isinstance(q, str) and isinstance(a, str)
+                    }
+                account["adv_custom_responses"] = clean
+            if "commands_enabled" in data and isinstance(data["commands_enabled"], dict):
+                account.setdefault("commands_enabled", {})
+                for cmd in COMMAND_KEYS:
+                    if cmd in data["commands_enabled"]:
+                        account["commands_enabled"][cmd] = bool(data["commands_enabled"][cmd])
+            if "bal_tracker_enabled" in data:
+                account["bal_tracker_enabled"] = bool(data["bal_tracker_enabled"])
+            if "fish_sell_currency" in data and data["fish_sell_currency"] in ("coins", "tokens"):
+                account["fish_sell_currency"] = data["fish_sell_currency"]
+            if "disable_interaction_lock" in data:
+                account["disable_interaction_lock"] = bool(data["disable_interaction_lock"])
+            if "limit_flags" in data:
+                account["limit_flags"] = bool(data["limit_flags"])
+            if "stealth_mode" in data and data["stealth_mode"] in ("strict", "moderate", "casual", "fast"):
+                account["stealth_mode"] = data["stealth_mode"]
+            if "cycle_uptime_mins" in data and isinstance(data["cycle_uptime_mins"], (int, float)) and not isinstance(data["cycle_uptime_mins"], bool):
+                account["cycle_uptime_mins"] = max(0, int(data["cycle_uptime_mins"]))
+            if "cycle_downtime_mins" in data and isinstance(data["cycle_downtime_mins"], (int, float)) and not isinstance(data["cycle_downtime_mins"], bool):
+                account["cycle_downtime_mins"] = max(0, int(data["cycle_downtime_mins"]))
+            if "search_custom_ranking" in data and isinstance(data["search_custom_ranking"], list):
+                account["search_custom_ranking"] = [str(x)[:120] for x in data["search_custom_ranking"][:300] if isinstance(x, str)]
+            if "crime_custom_ranking" in data and isinstance(data["crime_custom_ranking"], list):
+                account["crime_custom_ranking"] = [str(x)[:120] for x in data["crime_custom_ranking"][:100] if isinstance(x, str)]
+            cfg["accounts"][i] = account
+            break
+
+    modify_config(_update)
+    if not found:
+        return jsonify({"ok": False, "error": "Account not found"}), 404
     return jsonify({"ok": True})
 
 # ── Per-account balance ────────────────────────────────────
@@ -271,8 +340,7 @@ def get_account_balance(account_id):
 @app.route("/api/accounts/<account_id>/balance", methods=["DELETE"])
 def reset_account_balance(account_id):
     bal_path = os.path.join(BASE_DIR, f"balance_{account_id}.json")
-    with open(bal_path, "w") as f:
-        f.write("[]")
+    _write_json_atomic(bal_path, [])
     return jsonify({"ok": True})
 
 # ── Logs ───────────────────────────────────────────────────
@@ -325,6 +393,7 @@ def get_fish_stats(account_id):
 def reset_fish_stats(account_id):
     with _fish_lock:
         _fish_stats[account_id] = _make_fish_state()
+    _persist_stats()
     return jsonify({"ok": True})
 
 @app.route("/api/adv-types", methods=["GET"])
@@ -347,29 +416,39 @@ def get_market_sniper(account_id):
 @app.route("/api/accounts/<account_id>/market-sniper", methods=["POST"])
 def save_market_sniper(account_id):
     data = request.get_json(silent=True) or {}
-    cfg  = load_config()
-    for i, a in enumerate(cfg.get("accounts", [])):
-        if a["id"] != account_id:
-            continue
-        if "enabled" in data:
-            a["market_sniper_enabled"] = bool(data["enabled"])
-        if "items" in data and isinstance(data["items"], list):
-            a["market_sniper_items"] = [
-                {
-                    "name":      str(it.get("name", ""))[:50].strip(),
-                    "max_price": max(0, int(it.get("max_price", 0))),
-                    "buy_qty":   max(1, min(50, int(it.get("buy_qty", 1) or 1))),
-                }
-                for it in data["items"][:20]
-                if str(it.get("name", "")).strip() and int(it.get("max_price", 0)) > 0
-            ]
-        if "cooldown" in data:
-            v = int(data["cooldown"])
-            if v >= 5:
-                a["market_sniper_cooldown"] = v
-        cfg["accounts"][i] = a
-        break
-    save_config(cfg)
+    found = False
+    def _save(cfg):
+        nonlocal found
+        for i, a in enumerate(cfg.get("accounts", [])):
+            if a["id"] != account_id:
+                continue
+            found = True
+            if "enabled" in data:
+                a["market_sniper_enabled"] = bool(data["enabled"])
+            if "items" in data and isinstance(data["items"], list):
+                saved = []
+                for it in data["items"][:20]:
+                    if not isinstance(it, dict):
+                        continue
+                    try:
+                        name      = str(it.get("name", ""))[:50].strip()
+                        max_price = max(0, int(it.get("max_price", 0)))
+                        buy_qty   = max(1, min(50, int(it.get("buy_qty", 1) or 1)))
+                    except (TypeError, ValueError):
+                        continue
+                    if name and max_price > 0:
+                        saved.append({"name": name, "max_price": max_price, "buy_qty": buy_qty})
+                a["market_sniper_items"] = saved
+            if "cooldown" in data:
+                try: v = int(data["cooldown"])
+                except (TypeError, ValueError): v = 0
+                if v >= 5:
+                    a["market_sniper_cooldown"] = v
+            cfg["accounts"][i] = a
+            break
+    modify_config(_save)
+    if not found:
+        return jsonify({"ok": False, "error": "Account not found"}), 404
     return jsonify({"ok": True})
 
 @app.route("/api/market-sniper-stats/<account_id>", methods=["GET"])
@@ -389,8 +468,11 @@ def get_market_sniper_stats(account_id):
 def sniper_event(account_id):
     data  = request.get_json(silent=True) or {}
     item  = str(data.get("item",  ""))[:50]
-    price = int(data.get("price", 0))
-    qty   = int(data.get("qty",   1))
+    try:
+        price = int(data.get("price", 0))
+        qty   = int(data.get("qty",   1))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Invalid price/qty"}), 400
     if item and price > 0:
         with _sniper_lock:
             if account_id not in _sniper_stats:
@@ -401,12 +483,14 @@ def sniper_event(account_id):
             })
             if len(_sniper_stats[account_id]["buys"]) > 200:
                 _sniper_stats[account_id]["buys"] = _sniper_stats[account_id]["buys"][-200:]
+            _persist_stats()
     return jsonify({"ok": True})
 
 @app.route("/api/market-sniper-stats/<account_id>", methods=["DELETE"])
 def reset_market_sniper_stats(account_id):
     with _sniper_lock:
         _sniper_stats[account_id] = _make_sniper_state()
+    _persist_stats()
     return jsonify({"ok": True})
 
 # ── Mothership ─────────────────────────────────────────────
@@ -422,19 +506,22 @@ def get_mothership():
 def set_mothership():
     data = request.get_json(silent=True) or {}
     account_id = data.get("account_id")
-    cfg = load_config()
-    found = any(a["id"] == account_id for a in cfg.get("accounts", []))
+    found = False
+    def _set(cfg):
+        nonlocal found
+        found = any(a["id"] == account_id for a in cfg.get("accounts", []))
+        if found:
+            cfg["mothership_id"] = account_id
+    modify_config(_set)
     if not found:
         return jsonify({"ok": False, "error": "Account not found"}), 404
-    cfg["mothership_id"] = account_id
-    save_config(cfg)
     return jsonify({"ok": True})
 
 @app.route("/api/mothership", methods=["DELETE"])
 def clear_mothership():
-    cfg = load_config()
-    cfg["mothership_id"] = None
-    save_config(cfg)
+    def _clear(cfg):
+        cfg["mothership_id"] = None
+    modify_config(_clear)
     return jsonify({"ok": True})
 
 # ── Balance Tracker toggle ─────────────────────────────────
@@ -443,13 +530,18 @@ def clear_mothership():
 def toggle_bal_tracker(account_id):
     data    = request.get_json(silent=True) or {}
     enabled = bool(data.get("enabled", True))
-    cfg = load_config()
-    for i, a in enumerate(cfg.get("accounts", [])):
-        if a["id"] == account_id:
-            cfg["accounts"][i]["bal_tracker_enabled"] = enabled
-            save_config(cfg)
-            return jsonify({"ok": True, "enabled": enabled})
-    return jsonify({"ok": False, "error": "Account not found"}), 404
+    found = False
+    def _tog(cfg):
+        nonlocal found
+        for i, a in enumerate(cfg.get("accounts", [])):
+            if a["id"] == account_id:
+                cfg["accounts"][i]["bal_tracker_enabled"] = enabled
+                found = True
+                break
+    modify_config(_tog)
+    if not found:
+        return jsonify({"ok": False, "error": "Account not found"}), 404
+    return jsonify({"ok": True, "enabled": enabled})
 
 # ── Discord UID (set by bot on login) ──────────────────────
 
@@ -459,12 +551,17 @@ def set_discord_uid(account_id):
     uid  = str(data.get("discord_uid", "")).strip()
     if not uid:
         return jsonify({"ok": False}), 400
-    cfg = load_config()
-    for i, a in enumerate(cfg.get("accounts", [])):
-        if a["id"] == account_id:
-            cfg["accounts"][i]["discord_uid"] = uid
-            break
-    save_config(cfg)
+    found = False
+    def _set(cfg):
+        nonlocal found
+        for i, a in enumerate(cfg.get("accounts", [])):
+            if a["id"] == account_id:
+                cfg["accounts"][i]["discord_uid"] = uid
+                found = True
+                break
+    modify_config(_set)
+    if not found:
+        return jsonify({"ok": False, "error": "Account not found"}), 404
     return jsonify({"ok": True})
 
 # ── Mothership Transfer ─────────────────────────────────────
@@ -498,13 +595,11 @@ def trigger_transfer(account_id):
         "mothership_id":   mid,
     }
     trigger_path = os.path.join(BASE_DIR, f"transfer_trigger_{account_id}.json")
-    with open(trigger_path, "w") as f:
-        json.dump(trigger, f)
+    _write_json_atomic(trigger_path, trigger)
 
     # Clear previous status
     status_path = os.path.join(BASE_DIR, f"transfer_status_{account_id}.json")
-    with open(status_path, "w") as f:
-        json.dump({"status": "Starting...", "ts": int(time.time() * 1000), "done": False}, f)
+    _write_json_atomic(status_path, {"status": "Starting...", "ts": int(time.time() * 1000), "done": False})
 
     return jsonify({"ok": True})
 
@@ -516,6 +611,18 @@ def get_transfer_status(account_id):
             return jsonify(json.load(f))
     except Exception:
         return jsonify({"status": None, "ts": None, "done": True})
+
+# ── Manual resume (clears a CAPTCHA pause) ─────────────────
+
+@app.route("/api/accounts/<account_id>/resume", methods=["POST"])
+def resume_account(account_id):
+    resume_path = os.path.join(BASE_DIR, f"resume_{account_id}.flag")
+    try:
+        with open(resume_path, "w") as f:
+            f.write(str(int(time.time())))
+    except OSError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True})
 
 @app.route("/api/overview", methods=["GET"])
 def get_overview():
