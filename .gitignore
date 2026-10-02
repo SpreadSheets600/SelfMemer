@@ -23,3 +23,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Server cache
+server/__pycache__/

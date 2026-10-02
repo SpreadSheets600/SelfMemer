@@ -19,7 +19,12 @@ function postToApi(apiPath, data) {
 const accountArg = process.argv.find(a => a.startsWith('--account='));
 const ACCOUNT_ID = accountArg ? accountArg.split('=')[1] : 'default';
 
-const CONFIG_PATH = path.join(__dirname, 'config.json');
+const CONFIG_PATH = path.join(__dirname, '..', 'config.json');
+
+// Project root — all runtime artefacts (locks, flags, triggers, cycle
+// state) live here so the dashboard, tracker and bots share one location.
+const ROOT_DIR = path.join(__dirname, '..');
+const rootFile = name => path.join(ROOT_DIR, name);
 
 function loadAccountConfig() {
     const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
@@ -212,7 +217,7 @@ const client = new Client({
     },
 });
 const _interactionLock = new Mutex();
-_interactionLock.lockFilePath = path.join(__dirname, `interaction_lock_${ACCOUNT_ID}.lock`);
+_interactionLock.lockFilePath = rootFile(`interaction_lock_${ACCOUNT_ID}.lock`);
 
 // Wrapper: bypasses the mutex entirely when disable_interaction_lock is true
 function runWithLock(fn) {
@@ -369,9 +374,9 @@ const STEALTH_MODES = {
 
 // ── Limit Flags helpers ─────────────────────────────────────
 let _botPaused = false;  // set by cycleLoop when in downtime
-const PAUSED_FLAG = path.join(__dirname, `paused_${ACCOUNT_ID}.flag`);
-const CAPTCHA_FLAG = path.join(__dirname, `captcha_${ACCOUNT_ID}.flag`);
-const RESUME_FLAG  = path.join(__dirname, `resume_${ACCOUNT_ID}.flag`);
+const PAUSED_FLAG = rootFile(`paused_${ACCOUNT_ID}.flag`);
+const CAPTCHA_FLAG = rootFile(`captcha_${ACCOUNT_ID}.flag`);
+const RESUME_FLAG  = rootFile(`resume_${ACCOUNT_ID}.flag`);
 let _captchaPaused = false; // set until user clears via /api/.../resume
 
 function setPaused(paused, fromCaptcha = false) {
@@ -421,9 +426,6 @@ async function stealthSendDelay(channel) {
     }
     if (delay > 0) await sleep(delay);
 }
-
-// Dummy for backward compat — cycle replaces the old per-command sleep
-async function stealthExtraSleep() { }
 
 async function sendAndWait(channel, command, timeoutSecs = null) {
     const ms = (timeoutSecs ?? _cfg.wait_for_response) * 1000;
@@ -819,7 +821,7 @@ async function resolveChannel(client, channelId) {
 
 // Clear any stale paused flag from a previous crashed session
 for (const p of [PAUSED_FLAG, CAPTCHA_FLAG, RESUME_FLAG,
-                 path.join(__dirname, `interaction_lock_${ACCOUNT_ID}.lock`)]) {
+                 rootFile(`interaction_lock_${ACCOUNT_ID}.lock`)]) {
     try { fs.unlinkSync(p); } catch {}
 }
 
@@ -1041,7 +1043,7 @@ client.on('ready', async () => {
     }
 
     function writeTransferStatus(status, done = false) {
-        const statusPath = path.join(__dirname, `transfer_status_${ACCOUNT_ID}.json`);
+        const statusPath = rootFile(`transfer_status_${ACCOUNT_ID}.json`);
         try { fs.writeFileSync(statusPath, JSON.stringify({ status, ts: Date.now(), done })); } catch {}
         log('info', `[TRANSFER] ${status}`);
     }
@@ -1136,7 +1138,7 @@ client.on('ready', async () => {
                 writeTransferStatus(`Posted ${item.qty}x ${item.name} (ID: ${offerId}) — waiting for ${mothership_name}...`);
 
                 // Step 5: write pending file for the mothership to pick up
-                const pendingPath = path.join(__dirname, `market_pending_${ACCOUNT_ID}.json`);
+                const pendingPath = rootFile(`market_pending_${ACCOUNT_ID}.json`);
                 fs.writeFileSync(pendingPath, JSON.stringify({
                     offer_id: offerId, item: item.name, qty: item.qty, ts: Date.now(),
                 }));
@@ -1163,7 +1165,7 @@ client.on('ready', async () => {
     async function transferLoop() {
         while (true) {
             await sleep(2000);
-            const triggerPath = path.join(__dirname, `transfer_trigger_${ACCOUNT_ID}.json`);
+            const triggerPath = rootFile(`transfer_trigger_${ACCOUNT_ID}.json`);
             if (!fs.existsSync(triggerPath)) continue;
 
             let trigger;
@@ -1338,7 +1340,7 @@ client.on('ready', async () => {
         log('info', `[TRANSFER] Coins market offer ID: ${offerId}`);
         writeTransferStatus(`Posted coins offer (ID: ${offerId}) — waiting for ${mothership_name}...`);
 
-        const pendingPath = path.join(__dirname, `market_pending_coins_${ACCOUNT_ID}.json`);
+        const pendingPath = rootFile(`market_pending_coins_${ACCOUNT_ID}.json`);
         fs.writeFileSync(pendingPath, JSON.stringify({
             offer_id: offerId, item: 'coins', qty: toSend, ts: Date.now(),
         }));
@@ -1373,14 +1375,14 @@ client.on('ready', async () => {
             // Find pending offer files from any support vessel
             let pendingFiles;
             try {
-                pendingFiles = fs.readdirSync(__dirname)
+                pendingFiles = fs.readdirSync(ROOT_DIR)
                     .filter(f => f.startsWith('market_pending_') && f.endsWith('.json'));
             } catch { continue; }
 
             if (pendingFiles.length === 0) continue;
 
             for (const filename of pendingFiles) {
-                const pendingPath = path.join(__dirname, filename);
+                const pendingPath = rootFile(filename);
                 let pending;
                 try { pending = JSON.parse(fs.readFileSync(pendingPath, 'utf8')); } catch { continue; }
 
@@ -1438,7 +1440,7 @@ client.on('ready', async () => {
     // ── Uptime / Downtime cycle ──────────────────────────────
     // Polls every 5 s so config changes (disable, duration edits) take effect
     // within one polling tick instead of waiting for a full sleep to expire.
-    const CYCLE_STATE = path.join(__dirname, `cycle_${ACCOUNT_ID}.json`);
+    const CYCLE_STATE = rootFile(`cycle_${ACCOUNT_ID}.json`);
     function readCycleState() {
         try { return JSON.parse(fs.readFileSync(CYCLE_STATE, 'utf8')); } catch { return null; }
     }
@@ -2620,7 +2622,7 @@ client.on('ready', async () => {
     const TRIVIA_DB = (() => {
         const map = new Map();
         try {
-            const raw = JSON.parse(fs.readFileSync(path.join(__dirname, 'trivia.json'), 'utf8'));
+            const raw = JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'data', 'trivia.json'), 'utf8'));
             for (const [catB64, entries] of Object.entries(raw)) {
                 const category = Buffer.from(catB64, 'base64').toString().toLowerCase().trim();
                 for (const e of entries) {

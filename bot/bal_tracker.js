@@ -7,9 +7,10 @@ const { postLog } = require('./logger');
 const accountArg = process.argv.find(a => a.startsWith('--account='));
 const ACCOUNT_ID = accountArg ? accountArg.split('=')[1] : 'default';
 
-const CONFIG_PATH  = path.join(__dirname, 'config.json');
-const HISTORY_PATH = path.join(__dirname, `balance_${ACCOUNT_ID}.json`);
-const PAUSED_FLAG  = path.join(__dirname, `paused_${ACCOUNT_ID}.flag`);
+const ROOT_DIR     = path.join(__dirname, '..');
+const CONFIG_PATH  = path.join(ROOT_DIR, 'config.json');
+const HISTORY_PATH = path.join(ROOT_DIR, `balance_${ACCOUNT_ID}.json`);
+const PAUSED_FLAG  = path.join(ROOT_DIR, `paused_${ACCOUNT_ID}.flag`);
 
 function loadAccountConfig() {
     const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
@@ -214,7 +215,7 @@ client.on('ready', async () => {
         return;
     }
 
-    const LOCK_FILE = path.join(__dirname, `interaction_lock_${ACCOUNT_ID}.lock`);
+    const LOCK_FILE = path.join(ROOT_DIR, `interaction_lock_${ACCOUNT_ID}.lock`);
 
     async function waitForMainLock() {
         let warned = false;

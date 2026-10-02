@@ -18,7 +18,14 @@
             "wait_for_response": 10,
             "adv_cooldown": 1800,
             "adv_type": "Pepe Goes to Space",
+            "adv_response_mode": "recommended",
             "adv_custom_responses": {},
+            "daily_cooldown": 86400,
+            "work_cooldown": 3600,
+            "deposit_cooldown": 60,
+            "trivia_cooldown": 10,
+            "stream_cooldown": 660,
+            "pet_cooldown": 1800,
             "search_risk": "medium",
             "crime_risk": "medium",
             "search_custom_ranking": [],
@@ -34,7 +41,13 @@
                 "hl": false,
                 "pm": false,
                 "adv": false,
-                "fish": false
+                "fish": false,
+                "daily": false,
+                "work": false,
+                "deposit": false,
+                "trivia": false,
+                "stream": false,
+                "pet": false
             },
             "market_sniper_enabled": false,
             "market_sniper_cooldown": 30,
@@ -45,7 +58,7 @@
                     "buy_qty": 5
                 }
             ],
-            "market_study_item": "apple",
+            "market_study_item": "",
             "limit_flags": false,
             "stealth_mode": "moderate",
             "cycle_uptime_mins": 0,

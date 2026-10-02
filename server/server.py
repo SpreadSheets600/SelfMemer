@@ -4,12 +4,12 @@ import os
 import collections
 import threading
 import time
-import subprocess
 
-app = Flask(__name__, static_folder="web", static_url_path="")
-
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+WEB_DIR     = os.path.join(BASE_DIR, "web")
+
+app = Flask(__name__, static_folder=WEB_DIR, static_url_path="")
 
 NUMERIC_FIELDS = [
     "cooldown", "search_cooldown", "beg_cooldown", "crime_cooldown",
@@ -194,7 +194,7 @@ def _add_log(level, source, msg):
 
 @app.route("/")
 def index():
-    return send_from_directory("web", "index.html")
+    return send_from_directory(WEB_DIR, "index.html")
 
 # ── Accounts CRUD ──────────────────────────────────────────
 

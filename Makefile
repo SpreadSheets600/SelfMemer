@@ -1,20 +1,23 @@
-.PHONY: install run dev test
+.PHONY: install run bots dashboard test
 
 install:
 	npm install
-	pip install flask
+	pip install -r requirements.txt
 
 run:
 	bash start.sh
 
-dev:
-	python3 -c "from selfmemer import *" 2>/dev/null || true
-	@echo "Use: npm start"
+bots:
+	node bot/manager.js
+
+dashboard:
+	python3 server/server.py
 
 test:
-	node --check main.js
-	node --check manager.js
-	node --check bal_tracker.js
-	node --check fish_detector.js
-	python3 -c "import ast; ast.parse(open('server.py').read())"
+	node --check bot/main.js
+	node --check bot/manager.js
+	node --check bot/bal_tracker.js
+	node --check bot/fish_detector.js
+	node --check bot/logger.js
+	python3 -c "import ast; ast.parse(open('server/server.py').read())"
 	@echo "All syntax checks passed."

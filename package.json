@@ -4,8 +4,15 @@
   "private": true,
   "description": "Self-hosted, multi-account automation dashboard for Dank Memer on Discord",
   "license": "MIT",
+  "main": "bot/manager.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "start": "bash start.sh"
+    "start": "bash start.sh",
+    "bots": "node bot/manager.js",
+    "dashboard": "python3 server/server.py",
+    "test": "node --check bot/main.js && node --check bot/manager.js && node --check bot/bal_tracker.js && node --check bot/fish_detector.js && node --check bot/logger.js && python3 -c \"import ast; ast.parse(open('server/server.py').read())\" && echo 'All syntax checks passed.'"
   },
   "dependencies": {
     "debug": "^4.4.3",

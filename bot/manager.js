@@ -2,7 +2,10 @@ const { spawn } = require('child_process');
 const fs   = require('fs');
 const path = require('path');
 
-const CONFIG_PATH = path.join(__dirname, 'config.json');
+// Project root (one level above bot/) — config and runtime state live here
+// so existing setups keep working after the folder reorganization.
+const ROOT_DIR    = path.join(__dirname, '..');
+const CONFIG_PATH = path.join(ROOT_DIR, 'config.json');
 
 // accountId -> { main, bal, token, channelId, botId, balEnabled }
 const procs = new Map();
