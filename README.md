@@ -32,7 +32,7 @@ Join the [Support Server](https://discord.gg/bbRynPZpq)
 - **Fleet overview** — combined wallet, bank, and net worth totals across all accounts with per-account doughnut charts and a ranked leaderboard
 - **Live command toggles** — enable or disable hunt, dig, search, beg, crime, higher/lower, post meme, adventure, and fishing per account without restarting
 - **Market Sniper** — automatically scans `pls market view` and buys coin listings below your configured max price per item
-- **Fishing mode** — exclusive fishing loop with live catch stats, per-species chart, and configurable sell currency
+- **Fishing mode** — exclusive fishing loop with live catch stats, per-species chart, and configurable sell currency; turning it off restores the exact command toggles and balance-tracker state you had before
 - **Balance & net worth tracking** — 30-second polling with historical charts for wallet, bank, and net worth
 - **Mothership transfer system** — designate one account as the fleet command; support vessels can send their full inventory and wallet via friends share or market post in one click
 - **Stealth / anti-detection** — four preset modes (Strict / Moderate / Casual / Fast) controlling typing simulation, cooldown jitter, and uptime/downtime cycling
@@ -146,13 +146,16 @@ Live feed of every bot action, commands sent, responses received, button clicks,
 start.sh
   |
   |-- manager.js          Spawns and supervises all bot processes.
-  |     |                 Watches config.json every 5s and hot-reloads
+  |     |                 Watches config.json every 2s and hot-reloads
   |     |                 individual accounts without full restarts.
+  |     |                 Restart backoff: after 5 crashes in 90s an account
+  |     |                 is restarted every 60s instead of 5s.
   |     |
   |     |-- main.js       One instance per account. Runs all command loops
   |     |                 (hunt, dig, search, beg, crime, hl, pm, adv, fish),
   |     |                 market sniper, mothership transfers, stealth logic,
-  |     |                 and browser fingerprint headers.
+  |     |                 and browser fingerprint headers. Each loop is wrapped
+  |     |                 in a supervisor that restarts it if it crashes.
   |     |
   |     `-- bal_tracker.js  One instance per account. Sends pls bal every
   |                         30 seconds, clicks Net Worth, records history
@@ -160,6 +163,7 @@ start.sh
   |
   `-- server.py           Flask server on port 5000. Serves the dashboard,
                           provides the REST API, reads/writes config.json.
+                          Config writes are atomic and serialized under a lock.
 
 web/
   index.html              Single-page dashboard.
@@ -173,6 +177,11 @@ web/
 - A file-based interaction lock prevents `bal_tracker.js` from sending `pls bal` while a command is in-flight
 - Transfer trigger files let the dashboard request a mothership transfer; `main.js` picks them up on the next cycle
 - Config hot-reload: `main.js` reads `config.json` every 5 seconds and applies changed fields without restarting
+- Every command loop in `main.js` is wrapped in a supervisor: if it throws, the supervisor logs the error and restarts that loop after 5 seconds, so a single Discord hiccup can no longer silently disable a feature
+- The uptime/downtime cycle is persisted to `cycle_<id>.json`; a restart during downtime resumes the remaining rest window instead of resetting
+- CAPTCHA detection pauses the bot and writes `captcha_<id>.flag`. It is **not** auto-cleared — solve the CAPTCHA, then click **Resume bot** in the dashboard (or `POST /api/accounts/<id>/resume`)
+- Fish and sniper session stats persist to `fish_stats.json` / `sniper_stats.json` across server restarts
+- The market study probe (`pls market view` component dump + button click debug) only runs when `SELFMEMER_MARKET_STUDY` is set: `SELFMEMER_MARKET_STUDY=apple npm start`
 
 ## Requirements
 
@@ -208,6 +217,12 @@ npm install
 pip install flask
 ```
 
+…or install everything with one command:
+
+```bash
+make install
+```
+
 **Create your config file**
 
 ```bash
@@ -219,14 +234,14 @@ Open `config.json` and fill in your account details. See [Configuration](#config
 **Start the dashboard**
 
 ```bash
-bash start.sh
+npm start        # or: bash start.sh, or: make run
 ```
 
 Open `http://localhost:5000`. The dashboard connects to your accounts and begins running enabled commands immediately.
 
 ## Configuration
 
-`config.json` is excluded from version control — it contains your Discord token. Use `config.example.json` as the reference template.
+`config.json` is excluded from version control — it contains your Discord token, and it is also covered by `.gitignore` (along with balance history, lock/flag files, and transfer triggers). Use `config.example.json` as the reference template. If you cloned an older revision that still tracked it, run `git rm --cached config.json` once.
 
 ### Account fields
 
@@ -279,10 +294,12 @@ Open `http://localhost:5000`. The dashboard connects to your accounts and begins
 
 | Mode | Typing chance | Typing delay | CD variance | Speed |
 |---|---|---|---|---|
-| `strict` | 100% | 700–1400ms | ±35% | Slowest |
-| `moderate` | 80% | 300–600ms | ±20% (biased low) | Moderate |
-| `casual` | 40% | 100–300ms | ±10% (heavily biased) | Fast |
+| `strict` | 100% | 700–1400ms | +0–35% | Slowest |
+| `moderate` | 80% | 300–600ms | +0–20% (biased low) | Moderate |
+| `casual` | 40% | 100–300ms | +0–10% (heavily biased) | Fast |
 | `fast` | 0% | None | None | Maximum |
+
+The cooldown variance is one-sided: `humanJitter()` only ever *adds* a random 0–variance% to the configured cooldown, so scheduled durations are never shortened. This increases wait times slightly versus the configured base; adjust cooldowns accordingly.
 
 Browser fingerprint headers (Chrome 103 / Chrome OS UA, `x-super-properties`, all `Sec-*` headers) are **always active** and are not affected by `limit_flags` or stealth mode.
 
@@ -305,12 +322,20 @@ Browser fingerprint headers (Chrome 103 / Chrome OS UA, `x-super-properties`, al
 
 ## Security
 
-- `config.json` is in `.gitignore` and will not be committed
+- `config.json` is in `.gitignore` and will not be committed (run `git rm --cached config.json` once if upgrading from an older revision)
 - `balance_*.json` history files are also excluded
 - `attached_assets/` is excluded
-- Runtime state files (lock files, transfer triggers) are excluded
+- Runtime state files (lock files, transfer triggers, cycle state, stats caches) are excluded
 - No credentials are logged or sent anywhere other than directly to Discord
 - The Flask server binds to `0.0.0.0:5000` — if you expose this port externally, add authentication
+
+## Development
+
+```bash
+make test     # syntax-check all JS + Python sources
+```
+
+There is no test suite yet — contributions welcome.
 
 ## License
 
