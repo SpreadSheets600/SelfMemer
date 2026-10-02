@@ -378,6 +378,10 @@
             <span class="status-badge">Always On</span>
           </div>
         </div>
+        <button class="resume-btn" id="resume-btn" title="Unpause the bot after solving a CAPTCHA">
+          <svg class="icon" aria-hidden="true" style="width:13px;height:13px;vertical-align:-2px"><use href="#icon-check"/></svg>
+          Resume bot (clears CAPTCHA pause)
+        </button>
       </div>
     </div>
 
@@ -747,6 +751,11 @@
           <div class="adv-info-row">
             <svg class="adv-info-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
             Cooldown calculated automatically after each run.
+          </div>
+          <div class="cmd-cd-row" onclick="event.stopPropagation()">
+            <span class="cmd-cd-label">Base CD</span>
+            <input class="cmd-cd-input" type="number" min="60" data-config="adv_cooldown" onclick="event.stopPropagation()" />
+            <span class="cmd-cd-unit">s</span>
           </div>
       </div>
       <div class="cmd-card cmd-card--wide" data-cmd="crime">

@@ -73,6 +73,7 @@ let overviewActive = false;
 
 // Per-account transient state
 const acctState = {}; // id -> { logSince, logEntries, logFilter, logAutoScroll, logCleared, clearedBefore }
+let _fishPrev = null; // saved { cmds, bal } to restore when fishing exclusive mode is turned off
 function getAcctState(id) {
   if (!acctState[id]) {
     acctState[id] = {
@@ -374,10 +375,10 @@ document.getElementById("stealth-downtime")?.addEventListener("input", _saveCycl
 
 /* ── Stealth mode selector ───────────────────────────── */
 const SMODE_DETAILS = {
-  strict:   { typing: "Always — 700–1400ms",  variance: "35% (uniform spread)", speed: "Slowest" },
-  moderate: { typing: "80% — 300–600ms",      variance: "20% (biased low)",     speed: "Moderate" },
-  casual:   { typing: "40% — 100–300ms",      variance: "10% (heavily biased)", speed: "Fast" },
-  fast:     { typing: "Off",                  variance: "None",                 speed: "Maximum" },
+  strict:   { typing: "Always — 700–1400ms",  variance: "+0–35% (uniform spread)", speed: "Slowest" },
+  moderate: { typing: "80% — 300–600ms",      variance: "+0–20% (biased low)",     speed: "Moderate" },
+  casual:   { typing: "40% — 100–300ms",      variance: "+0–10% (heavily biased)", speed: "Fast" },
+  fast:     { typing: "Off",                  variance: "None",                     speed: "Maximum" },
 };
 
 function applySteathMode(mode) {
@@ -734,7 +735,7 @@ function switchAccount(id) {
   const DEFAULTS = {
     cooldown: 20, search_cooldown: 25, beg_cooldown: 40,
     crime_cooldown: 40, hl_cooldown: 10, hl_wait_for: 5,
-    pm_cooldown: 20, wait_for_response: 10,
+    pm_cooldown: 20, wait_for_response: 10, adv_cooldown: 1800,
     daily_cooldown: 86400, work_cooldown: 3600,
     deposit_cooldown: 60, trivia_cooldown: 10,
     stream_cooldown: 660, pet_cooldown: 1800,
@@ -1440,23 +1441,34 @@ document.querySelectorAll(".cmd-card, .fish-toggle-row").forEach(card => {
 
     if (cmd === "fish") {
       if (newVal) {
-        // Exclusive ON: disable all other commands + bal tracker
+        // Exclusive ON: remember current state, disable all other commands + bal tracker
         const OTHER_CMDS = ["hunt","dig","search","beg","crime","hl","pm","adv","daily","work","deposit","trivia","stream","pet"];
+        const acc = accounts.find(a => a.id === activeId);
+        _fishPrev = {
+          cmds: { ...cmdState },
+          bal: !acc || acc.bal_tracker_enabled !== false,
+        };
         OTHER_CMDS.forEach(c => applyToggle(c, false));
         applyToggle("fish", true);
         applyFishUI(true);
         const newCmds = { ...cmdState };
         await pushAccountConfig({ commands_enabled: newCmds, bal_tracker_enabled: false });
-        const acc = accounts.find(a => a.id === activeId);
         if (acc) acc.bal_tracker_enabled = false;
         updateBalToggleUI(false);
         showToast("Fishing exclusive mode ON — all other commands paused");
       } else {
-        // Exclusive OFF: just disable fish
+        // Exclusive OFF: disable fish and restore the exact previous state
         applyToggle("fish", false);
         applyFishUI(false);
-        await pushAccountConfig({ commands_enabled: { ...cmdState } });
-        showToast("Fishing disabled");
+        const acc = accounts.find(a => a.id === activeId);
+        const restoredCmds = _fishPrev?.cmds ? { ..._fishPrev.cmds, fish: false } : { ...cmdState, fish: false };
+        const restoreBal   = _fishPrev ? _fishPrev.bal : true;
+        _fishPrev = null;
+        for (const c of Object.keys(restoredCmds)) applyToggle(c, restoredCmds[c]);
+        await pushAccountConfig({ commands_enabled: restoredCmds, bal_tracker_enabled: restoreBal });
+        if (acc) acc.bal_tracker_enabled = restoreBal;
+        updateBalToggleUI(restoreBal);
+        showToast("Fishing disabled — previous settings restored");
       }
     } else {
       // Normal command toggle — if fish is active, fish takes precedence (do nothing)
@@ -2250,6 +2262,19 @@ async function fetchOverview() {
 }
 
 document.getElementById("ov-refresh-btn").addEventListener("click", fetchOverview);
+
+// ── Resume bot (clears a CAPTCHA-forced pause) ─────────
+document.getElementById("resume-btn")?.addEventListener("click", async () => {
+  if (!activeId) { showToast("Select an account first", "err"); return; }
+  try {
+    const res = await fetch(`/api/accounts/${activeId}/resume`, { method: "POST" });
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || "Server error");
+    showToast("Resume requested — bot will unpause within a few seconds");
+  } catch (e) {
+    showToast("Resume failed: " + e.message, "err");
+  }
+});
 
 /* ── Boot ───────────────────────────────────────────── */
 async function boot() {

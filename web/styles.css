@@ -998,6 +998,21 @@ body {
 .status-card.disabled .status-badge { background: var(--bg-2); color: var(--text-3); border-color: var(--border); }
 .status-card.disabled .status-name  { opacity: 0.5; }
 
+/* ── Resume button ───────────────────────────────── */
+.resume-btn {
+  margin-top: 8px;
+  width: 100%;
+  padding: 9px 12px;
+  font-size: 12px; font-weight: 600;
+  color: var(--text-2);
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: var(--r-lg);
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s;
+}
+.resume-btn:hover { background: var(--bg-2); color: var(--text-1); }
+
 /* ── Balance Tracker toggle ──────────────────────── */
 .bal-toggle {
   position: relative; display: inline-flex;
