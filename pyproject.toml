@@ -1,8 +1,8 @@
 [project]
-name = "repl-nix-workspace"
-version = "0.1.0"
-description = "Add your description here"
-requires-python = ">=3.11"
+name = "selfmemer"
+version = "1.0.0"
+description = "Self-hosted, multi-account automation dashboard for Dank Memer on Discord"
+requires-python = ">=3.10"
 dependencies = [
     "flask>=3.1.3",
 ]
