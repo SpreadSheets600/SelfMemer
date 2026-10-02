@@ -7,6 +7,22 @@ const CONFIG_PATH = path.join(__dirname, 'config.json');
 // accountId -> { main, bal, token, channelId, botId, balEnabled }
 const procs = new Map();
 
+// ── Restart backoff ────────────────────────────────────────
+// If an account crashes repeatedly (bad token, bad channel id), restart
+// every 5s at first, then back off to 60s so we don't hammer Discord.
+const crashHistory = new Map(); // id -> number[] of exit timestamps
+function restartDelay(id) {
+    const now = Date.now();
+    const recent = (crashHistory.get(id) || []).filter(t => now - t < 90000);
+    recent.push(now);
+    crashHistory.set(id, recent);
+    if (recent.length >= 5) {
+        console.log(`[MANAGER] main.js[${id}] crashed ${recent.length}× in 90s — backing off to 60s`);
+        return 60000;
+    }
+    return 5000;
+}
+
 function loadAccounts() {
     try {
         return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')).accounts || [];
@@ -21,7 +37,7 @@ function spawnBal(account) {
         try { existing.bal.kill('SIGTERM'); } catch {}
         existing.bal = null;
     }
-    const balProc = spawn('node', ['bal_tracker.js', `--account=${id}`], { stdio: 'inherit' });
+    const balProc = spawn('node', [path.join(__dirname, 'bal_tracker.js'), `--account=${id}`], { stdio: 'inherit', cwd: __dirname });
     balProc.on('exit', code => {
         const p = procs.get(id);
         if (!p) return;
@@ -56,11 +72,12 @@ function spawnAccount(account) {
 
     const balEnabled = account.bal_tracker_enabled !== false;
 
-    const mainProc = spawn('node', ['main.js', `--account=${id}`], { stdio: 'inherit' });
+    const mainProc = spawn('node', [path.join(__dirname, 'main.js'), `--account=${id}`], { stdio: 'inherit', cwd: __dirname });
     mainProc.on('exit', code => {
         if (code !== null && code !== 0) {
-            console.log(`[MANAGER] main.js[${id}] exited with code ${code} — restarting in 5s`);
-            setTimeout(() => { if (procs.has(id)) spawnAccount(account); }, 5000);
+            const delay = restartDelay(id);
+            console.log(`[MANAGER] main.js[${id}] exited with code ${code} — restarting in ${delay / 1000}s`);
+            setTimeout(() => { if (procs.has(id)) spawnAccount(account); }, delay);
         }
     });
 

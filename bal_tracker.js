@@ -34,7 +34,9 @@ try { history = JSON.parse(fs.readFileSync(HISTORY_PATH, 'utf8')); } catch { his
 
 function saveHistory() {
     if (history.length > 2000) history = history.slice(-2000);
-    fs.writeFileSync(HISTORY_PATH, JSON.stringify(history));
+    const tmp = HISTORY_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(history));
+    try { fs.renameSync(tmp, HISTORY_PATH); } catch { fs.writeFileSync(HISTORY_PATH, JSON.stringify(history)); }
 }
 
 // ── Text extractor ─────────────────────────────────────────
@@ -159,6 +161,7 @@ const client = new Client({ checkUpdate: false });
 let waitingForBal    = false;
 let sentBalMsgId     = null; // ID of the 'pls bal' message we sent
 let netWorthPending  = null; // { msgId, resolve, timer }
+let lastBalRef       = null; // { id, at } of last 'pls bal' — for late-reply rescue
 
 async function resolveChannel(client, channelId) {
     log('info', 'Waiting for guild sync...');
@@ -235,6 +238,7 @@ client.on('ready', async () => {
         try {
             const sent = await channel.send('pls bal');
             sentBalMsgId = sent.id;
+            lastBalRef   = { id: sent.id, at: Date.now() };
             log('info', 'Sent: pls bal');
         } catch (err) {
             log('error', `Send failed: ${err.message}`);
@@ -271,16 +275,29 @@ client.on('raw', packet => {
 
     // ── Balance: listen for the bot reply ───────────────────
     if (packet.t !== 'MESSAGE_CREATE') return;
-    if (!waitingForBal) return;
     const msg = packet.d;
     if (msg.channel_id !== CHANNEL_ID) return;
-    if (msg.author?.id !== BOT_ID) return;
-    // Only accept replies that reference the exact 'pls bal' we sent.
-    // If sentBalMsgId is still null (send hasn't returned yet), reject everything.
-    if (!sentBalMsgId || msg.message_reference?.message_id !== sentBalMsgId) return;
-    waitingForBal = false;
-    sentBalMsgId  = null;
+    if (msg.author?.id !== BOT_ID)     return;
 
+    if (waitingForBal) {
+        if (!sentBalMsgId || msg.message_reference?.message_id !== sentBalMsgId) return;
+        waitingForBal = false;
+        sentBalMsgId  = null;
+        handleBalanceResponse(msg);
+        return;
+    }
+
+    // Late reply: we already timed out, but a reply to our last 'pls bal'
+    // arrived within the grace window — keep it as a sample instead of dropping it.
+    if (lastBalRef && msg.message_reference?.message_id === lastBalRef.id &&
+        Date.now() - lastBalRef.at < 60000) {
+        lastBalRef = null;
+        log('warn', '[BAL] Reply to pls bal arrived after timeout — accepted as a late sample');
+        handleBalanceResponse(msg);
+    }
+});
+
+async function handleBalanceResponse(msg) {
     const { wallet, bank, bankMax } = parseBalance(msg);
     if (wallet === null) {
         log('warn', 'Balance parse failed — no numbers found in response');
@@ -288,52 +305,56 @@ client.on('raw', packet => {
     }
 
     // ── Net Worth: click button then await MESSAGE_UPDATE ───
-    (async () => {
-        let netWorth = null;
-        const customId = findNetWorthCustomId(msg.components || []);
-        if (customId) {
-            try {
-                const channel = client.channels.cache.get(CHANNEL_ID);
-                const message = await channel.messages.fetch(msg.id);
-
-                const nwPromise = new Promise(resolve => {
-                    const timer = setTimeout(() => {
-                        if (netWorthPending?.msgId === msg.id) netWorthPending = null;
-                        resolve(null);
-                    }, 8000);
-                    netWorthPending = { msgId: msg.id, resolve, timer };
-                });
-
-                await message.clickButton(customId);
-                log('info', 'Clicked Net Worth button');
-
-                const updatedMsg = await nwPromise;
-                if (updatedMsg) {
-                    netWorth = parseNetWorth(updatedMsg);
-                    if (netWorth !== null) log('info', `Net Worth: ⏣${netWorth.toLocaleString()}`);
-                    else log('warn', 'Net worth parse failed — BankrobIcon not found');
-                } else {
-                    log('warn', 'Net worth timeout — no MESSAGE_UPDATE received');
-                }
-            } catch (e) {
-                log('warn', `Net Worth skipped: ${e.message}`);
-                if (netWorthPending?.msgId === msg.id) netWorthPending = null;
-            }
-        } else {
-            log('warn', 'Net Worth button not found in balance message');
-        }
-
-        // If the file was externally cleared (reset button), wipe in-memory history
-        // before pushing the new entry so it becomes entry #1 rather than being lost
+    let netWorth = null;
+    const customId = findNetWorthCustomId(msg.components || []);
+    if (customId) {
         try {
-            const onDisk = JSON.parse(fs.readFileSync(HISTORY_PATH, 'utf8'));
-            if (!Array.isArray(onDisk) || onDisk.length === 0) history = [];
-        } catch {}
-        const entry = { ts: Date.now(), wallet, bank: bank ?? 0, bankMax: bankMax ?? 0, netWorth };
-        history.push(entry);
-        saveHistory();
-        log('info', `Balance — wallet=⏣${wallet.toLocaleString()}  bank=⏣${(bank ?? 0).toLocaleString()}/${(bankMax ?? 0).toLocaleString()}${netWorth !== null ? `  netWorth=⏣${netWorth.toLocaleString()}` : ''}`);
-    })().catch(e => log('warn', `Balance handler error: ${e.message}`));
+            const channel = client.channels.cache.get(CHANNEL_ID);
+            const message = await channel.messages.fetch(msg.id);
+
+            const nwPromise = new Promise(resolve => {
+                const timer = setTimeout(() => {
+                    if (netWorthPending?.msgId === msg.id) netWorthPending = null;
+                    resolve(null);
+                }, 8000);
+                netWorthPending = { msgId: msg.id, resolve, timer };
+            });
+
+            await message.clickButton(customId);
+            log('info', 'Clicked Net Worth button');
+
+            const updatedMsg = await nwPromise;
+            if (updatedMsg) {
+                netWorth = parseNetWorth(updatedMsg);
+                if (netWorth !== null) log('info', `Net Worth: ⏣${netWorth.toLocaleString()}`);
+                else log('warn', 'Net worth parse failed — BankrobIcon not found');
+            } else {
+                log('warn', 'Net worth timeout — no MESSAGE_UPDATE received');
+            }
+        } catch (e) {
+            log('warn', `Net Worth skipped: ${e.message}`);
+            if (netWorthPending?.msgId === msg.id) netWorthPending = null;
+        }
+    } else {
+        log('warn', 'Net Worth button not found in balance message');
+    }
+
+    // If the file was externally cleared (reset button), wipe in-memory history
+    // before pushing the new entry so it becomes entry #1 rather than being lost
+    try {
+        const onDisk = JSON.parse(fs.readFileSync(HISTORY_PATH, 'utf8'));
+        if (!Array.isArray(onDisk) || onDisk.length === 0) history = [];
+    } catch {}
+    const entry = { ts: Date.now(), wallet, bank: bank ?? 0, bankMax: bankMax ?? 0, netWorth };
+    history.push(entry);
+    saveHistory();
+    log('info', `Balance — wallet=⏣${wallet.toLocaleString()}  bank=⏣${(bank ?? 0).toLocaleString()}/${(bankMax ?? 0).toLocaleString()}${netWorth !== null ? `  netWorth=⏣${netWorth.toLocaleString()}` : ''}`);
+}
+
+client.login(TOKEN).catch(err => {
+    log('error', `Login failed: ${err.message} — check token`);
+    process.exit(1);
 });
 
-client.login(TOKEN);
+process.on('SIGTERM', () => { try { client.destroy(); } catch {} process.exit(0); });
+process.on('SIGINT',  () => { try { client.destroy(); } catch {} process.exit(0); });
